@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "github-mcp-secure",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-01",
+
+  // SECURITY: the Worker must only be reachable through the Access-protected
+  // custom domain. Disable every other way in.
+  "workers_dev": false,
+  "preview_urls": false,
+
+  // TODO: your hostname. The domain's zone must be on your Cloudflare account.
+  "routes": [{ "pattern": "github.parroquia.app", "custom_domain": true }],
+
+  "observability": { "enabled": true },
+
+  "vars": {
+    // TODO: your Zero Trust team domain (Zero Trust -> Settings -> Custom Pages)
+    "ACCESS_TEAM_DOMAIN": "https://hidden-base-b37f.cloudflareaccess.com",
+    // TODO: the "aud" returned when you create the Access app (scripts/create-access-app.sh)
+    "ACCESS_AUD": "6e9d9619596533b9e6e2259ff448ce7b54209b2ee976cb2fe777e14b70da0827",
+    // TODO: the ONE repository this server may touch: owner/name
+    "ALLOWED_REPO": "catholicweb/web-template",
+    // Base branch for PRs. Never writable through this server.
+    "DEFAULT_BRANCH": "main",
+    // The only branches this server can create or push to.
+    "BRANCH_PREFIX": "claude/"
+    // Optional defense in depth: also require this email claim in the Access JWT.
+    // "ALLOWED_EMAIL": "you@example.com"
+  }
+  // GITHUB_TOKEN is a secret: `npx wrangler secret put GITHUB_TOKEN` (never put it here)
+}
