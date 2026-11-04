@@ -10,6 +10,9 @@ export class GitHubError extends UserError {
   }
 }
 
+/** The named branch does not exist (callers may create it). */
+export class BranchMissing extends UserError {}
+
 interface Ref {
   object: { sha: string };
 }
@@ -86,7 +89,7 @@ export class GitHub {
     try {
       ref = await this.request<Ref>("GET", `/git/ref/heads/${encPath(branch)}`);
     } catch (e) {
-      if (e instanceof GitHubError && e.status === 404) throw new UserError(`branch "${branch}" does not exist`);
+      if (e instanceof GitHubError && e.status === 404) throw new BranchMissing(`branch "${branch}" does not exist`);
       throw e;
     }
     const commit = await this.request<CommitObj>("GET", `/git/commits/${ref.object.sha}`);
