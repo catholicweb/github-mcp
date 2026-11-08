@@ -113,7 +113,13 @@ Afterwards, in the connector's tool permissions, set the write tools (`branch_cr
 
 ## Tools
 
-`repo_tree`, `file_get`, `branches_list`, `branch_create`, `push_files`, `pr_create`, `prs_list`, `pr_get`.
+`repo_tree`, `file_get`, `grep`, `branches_list`, `branch_create`, `push_files`, `pr_create`, `prs_list`, `pr_get`.
+
+Token-saving helpers for an AI client:
+
+- **`grep`**: regex or literal search over a branch (glob / path filters, context lines), returning `path:line:text`. It scans at most 120 text files per call (one GitHub subrequest each); binary, >200 KB and lock files are skipped, and the result says when the scan was limited.
+- **`file_get` with `paths`**: read up to 20 files (optionally the same line range of each) in one call; a bad path is reported inline instead of failing the call. Files the contents API already inlines no longer cost a second blob request.
+- **Built-in validation** (`checkContent` in `src/validate.ts`) runs on every file `push_files` would write: `.json` must parse (tsconfig/jsconfig/`.vscode` JSONC files and already-broken files only warn), NUL bytes are rejected, merge-conflict markers warn. Errors abort before anything is committed; warnings are listed in the result. Add more dependency-free checks there.
 
 ## Tuning the restrictions
 
