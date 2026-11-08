@@ -1,8 +1,10 @@
 import { BranchMissing, GitHub, GitHubError, bytesToUtf8, encPath, type TreeEntry } from "./github.ts";
 import { applyEdits, countLines, parseEdits, renderFile, type Edit } from "./edit.ts";
+import { escapeRegExp, globToRegExp, grepText } from "./search.ts";
 import {
   UserError,
   asObject,
+  checkContent,
   optBool,
   optInt,
   optString,
@@ -77,6 +79,15 @@ async function openPr(gh: GitHub, cfg: Config, head: string, pr: PrInput): Promi
   return `Opened PR #${created.number}: ${created.html_url}`;
 }
 
+const GREP_MAX_FILES = 120; // each scanned file costs one GitHub subrequest
+const GREP_MAX_FILE_BYTES = 200_000;
+const GREP_SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|bmp|pdf|zip|gz|tgz|tar|7z|woff2?|ttf|otf|eot|mp[34]|mov|avi|wasm|bin|exe|dll|so|dylib|class|jar|psd|sqlite3?)$/i;
+const GREP_SKIP_LOCK = /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|composer\.lock|poetry\.lock|Gemfile\.lock)$/;
+
+type ContentsMeta =
+  | { type: string; sha: string; size: number; path: string; content?: string; encoding?: string }
+  | { type: string; name: string; path: string; size: number }[];
+
 export const tools: ToolDef[] = [
   {
     name: "repo_tree",
@@ -106,40 +117,155 @@ export const tools: ToolDef[] = [
   {
     name: "file_get",
     description:
-      "Read a text file from a branch (or list a directory). Output starts with a one-line header (path, short blob sha, line count). " +
+      "Read text files from a branch (or list a directory). Output starts with a one-line header (path, short blob sha, line count). " +
       "For big files read just what you need with start_line/end_line (1-based, inclusive) instead of the whole file; " +
-      "output is capped and tells you where to continue. line_numbers is off by default so text can be copied straight into push_files edits.",
+      "output is capped and tells you where to continue. Pass `paths` (max 20) to read several files in one call. " +
+      "line_numbers is off by default so text can be copied straight into push_files edits.",
     inputSchema: {
       type: "object",
       properties: {
-        path: { type: "string" },
+        path: { type: "string", description: "One file or directory. Use this or `paths`." },
+        paths: { type: "array", items: { type: "string" }, description: "Several files in one call (max 20); the line range applies to each." },
         branch: { type: "string", description: "Defaults to the repo default branch." },
         start_line: { type: "integer", minimum: 1, description: "First line to return (default 1)." },
         end_line: { type: "integer", minimum: 1, description: "Last line to return (default: end of file)." },
         line_numbers: { type: "boolean", description: "Prefix each line with its number + tab (display only; never include it in edits). Default false." },
       },
-      required: ["path"],
       additionalProperties: false,
     },
     annotations: readOnly,
     async run(gh, cfg, a) {
-      const path = reqString(a.path, "path", 1, 400);
-      if (path.includes("..") || path.startsWith("/")) throw new UserError("path: invalid");
+      if (a.path !== undefined && a.paths !== undefined) throw new UserError("use either path or paths, not both");
+      let paths: string[];
+      if (a.paths !== undefined) {
+        if (!Array.isArray(a.paths) || a.paths.length < 1 || a.paths.length > 20) throw new UserError("paths: must be an array of 1-20 paths");
+        paths = a.paths.map((p, i) => reqString(p, `paths[${i}]`, 1, 400));
+      } else {
+        paths = [reqString(a.path, "path", 1, 400)];
+      }
+      for (const p of paths) if (p.includes("..") || p.startsWith("/")) throw new UserError("path: invalid");
       const branch = validateBranchName(a.branch ?? cfg.defaultBranch);
       const start = optInt(a.start_line, "start_line", 1, 10_000_000, 0);
       const end = optInt(a.end_line, "end_line", 1, 10_000_000, 0);
       if (start && end && end < start) throw new UserError("end_line must be >= start_line");
       const numbered = optBool(a.line_numbers, "line_numbers", false);
-      const meta = await gh.request<
-        | { type: "file"; sha: string; size: number; path: string }
-        | { type: string; name: string; path: string; size: number }[]
-      >("GET", `/contents/${encPath(path)}?ref=${encodeURIComponent(branch)}`);
-      if (Array.isArray(meta)) return meta.map((e) => `${e.type}\t${e.size}\t${e.path}`).join("\n");
-      if (meta.type !== "file") throw new UserError(`${path} is a ${meta.type}, not a regular file`);
-      const blob = await gh.request<{ content: string; encoding: string }>("GET", `/git/blobs/${meta.sha}`);
-      const text = bytesToUtf8(blob.content);
-      if (text === null) return `${path} is a binary file (${meta.size} bytes); not shown.`;
-      return renderFile({ path, branch, sha: meta.sha }, text, { start, end, numbered });
+
+      const read = async (path: string, budget: number, multi: boolean): Promise<string> => {
+        const meta = await gh.request<ContentsMeta>("GET", `/contents/${encPath(path)}?ref=${encodeURIComponent(branch)}`);
+        if (Array.isArray(meta)) {
+          const listing = meta.map((e) => `${e.type}\t${e.size}\t${e.path}`).join("\n");
+          return multi ? `# ${path} (directory)\n\n${listing}` : listing;
+        }
+        if (meta.type !== "file") throw new UserError(`${path} is a ${meta.type}, not a regular file`);
+        // The contents API already inlines files up to 1 MB; only fall back to the blob API when it does not.
+        let b64 = meta.encoding === "base64" && meta.content ? meta.content : undefined;
+        if (b64 === undefined) b64 = (await gh.request<{ content: string }>("GET", `/git/blobs/${meta.sha}`)).content;
+        const text = bytesToUtf8(b64);
+        if (text === null) return `${path} is a binary file (${meta.size} bytes); not shown.`;
+        return renderFile({ path, branch, sha: meta.sha }, text, { start, end, numbered }, budget);
+      };
+
+      if (paths.length === 1) return read(paths[0]!, 60_000, false);
+      // Multi-read: one bad path must not cost the caller a whole retry round.
+      const budget = Math.floor(60_000 / paths.length);
+      const blocks = await Promise.all(
+        paths.map(async (p) => {
+          try {
+            return await read(p, budget, true);
+          } catch (e) {
+            if (e instanceof UserError) return `# ${p}: ERROR: ${e.message}`;
+            throw e;
+          }
+        }),
+      );
+      return blocks.join("\n\n");
+    },
+  },
+  {
+    name: "grep",
+    description:
+      `Search file contents on a branch with a regex (or literal text). Returns "path:line:text" matches, with optional context lines, so you rarely need to read whole files. ` +
+      `Scans at most ${GREP_MAX_FILES} text files (binary, >200 KB and lock files are skipped); narrow with path_prefix or glob.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "JavaScript regex, or plain text with literal=true." },
+        branch: { type: "string", description: "Defaults to the repo default branch." },
+        path_prefix: { type: "string", description: "Only search paths starting with this prefix." },
+        glob: { type: "string", description: 'Only search matching paths, e.g. "**/*.ts" or "*.{js,ts}" (no "/" = match file name at any depth).' },
+        literal: { type: "boolean", description: "Treat pattern as plain text." },
+        ignore_case: { type: "boolean" },
+        context: { type: "integer", minimum: 0, maximum: 5, description: "Lines of context around each match (default 0)." },
+        max_results: { type: "integer", minimum: 1, maximum: 200, description: "Default 50." },
+      },
+      required: ["pattern"],
+      additionalProperties: false,
+    },
+    annotations: readOnly,
+    async run(gh, cfg, a) {
+      const pattern = reqString(a.pattern, "pattern", 1, 300);
+      const literal = optBool(a.literal, "literal", false);
+      const ignoreCase = optBool(a.ignore_case, "ignore_case", false);
+      let re: RegExp;
+      try {
+        re = new RegExp(literal ? escapeRegExp(pattern) : pattern, ignoreCase ? "i" : "");
+      } catch (e) {
+        throw new UserError(`pattern: invalid regex (${(e as Error).message.slice(0, 150)})`);
+      }
+      const prefix = optString(a.path_prefix, "path_prefix", 400) ?? "";
+      const globStr = optString(a.glob, "glob", 200);
+      let globRe: RegExp | null = null;
+      try {
+        globRe = globStr ? globToRegExp(globStr) : null;
+      } catch {
+        throw new UserError("glob: invalid pattern");
+      }
+      const context = optInt(a.context, "context", 0, 5, 0);
+      const max = optInt(a.max_results, "max_results", 1, 200, 50);
+      const branch = validateBranchName(a.branch ?? cfg.defaultBranch);
+
+      const head = await gh.branchHead(branch);
+      const { tree, truncated } = await gh.getTree(head.treeSha);
+      let skipped = 0;
+      const candidates = tree
+        .filter((e) => e.type === "blob" && e.mode !== "120000" && e.path.startsWith(prefix) && (!globRe || globRe.test(e.path)))
+        .filter((e) => {
+          const skip = GREP_SKIP_EXT.test(e.path) || GREP_SKIP_LOCK.test(e.path) || (e.size ?? 0) > GREP_MAX_FILE_BYTES;
+          if (skip) skipped++;
+          return !skip;
+        })
+        .sort((x, y) => (x.path < y.path ? -1 : 1));
+      const scanList = candidates.slice(0, GREP_MAX_FILES);
+
+      const out: string[] = [];
+      let matches = 0;
+      let files = 0;
+      let scanned = 0;
+      for (let i = 0; i < scanList.length && matches < max; i += 10) {
+        const batch = scanList.slice(i, i + 10);
+        const texts = await Promise.all(
+          batch.map(async (e) => bytesToUtf8((await gh.request<{ content: string }>("GET", `/git/blobs/${e.sha}`)).content)),
+        );
+        scanned += batch.length;
+        for (let j = 0; j < batch.length && matches < max; j++) {
+          const t = texts[j];
+          if (t === null || t === undefined) continue;
+          const r = grepText(batch[j]!.path, t, re, context, max - matches);
+          if (r.matches === 0) continue;
+          if (context > 0 && out.length > 0) out.push("--");
+          out.push(...r.out);
+          matches += r.matches;
+          files++;
+        }
+      }
+
+      const notes: string[] = [];
+      if (matches >= max) notes.push("stopped at max_results");
+      if (candidates.length > GREP_MAX_FILES) notes.push(`only the first ${GREP_MAX_FILES} of ${candidates.length} files were scanned; narrow with path_prefix or glob`);
+      if (skipped > 0) notes.push(`${skipped} binary/large/lock files skipped`);
+      if (truncated) notes.push("GitHub truncated the tree; narrow with path_prefix");
+      const header = `${matches} match${matches === 1 ? "" : "es"} in ${files} file${files === 1 ? "" : "s"} (scanned ${scanned})${notes.length ? `; ${notes.join("; ")}` : ""}`;
+      return truncate(out.length ? `${header}\n${out.join("\n")}` : header);
     },
   },
   {
@@ -325,7 +451,7 @@ export const tools: ToolDef[] = [
             throw new UserError(`${w.path}: expected_sha does not match the current file (changed or missing on ${branch}); re-read it with file_get`);
           }
           if (w.content !== undefined) {
-            return { w, cur, content: w.content, note: `${cur ? "overwritten" : "created"}, ${countLines(w.content)} lines` };
+            return { w, cur, content: w.content, original: undefined as string | undefined, note: `${cur ? "overwritten" : "created"}, ${countLines(w.content)} lines` };
           }
           if (!cur) throw new UserError(`${w.path}: cannot patch, file does not exist on ${branch}${missingNote}; use content to create it`);
           if ((cur.size ?? 0) > MAX_FILE_CHARS) throw new UserError(`${w.path}: too large to patch (${cur.size} bytes)`);
@@ -333,7 +459,7 @@ export const tools: ToolDef[] = [
           const text = bytesToUtf8(blob.content);
           if (text === null) throw new UserError(`${w.path}: binary file, cannot patch`);
           const res = applyEdits(text, w.edits!, w.path);
-          return { w, cur, content: res.text, note: `patched, ${res.replacements} replacement(s), ${countLines(text)}→${countLines(res.text)} lines` };
+          return { w, cur, content: res.text, original: text as string | undefined, note: `patched, ${res.replacements} replacement(s), ${countLines(text)}→${countLines(res.text)} lines` };
         }),
       );
 
@@ -345,6 +471,18 @@ export const tools: ToolDef[] = [
         report.push(`- ${r.w.path}: ${r.note}`);
       }
       if (total > MAX_TOTAL_CHARS) throw new UserError(`total content too large (max ${MAX_TOTAL_CHARS} chars)`);
+
+      // Built-in validation: catches broken output now, instead of a read-back round trip later.
+      const problems: string[] = [];
+      const warnings: string[] = [];
+      for (const r of resolved) {
+        for (const issue of checkContent(r.w.path, r.content, r.original)) {
+          (issue.level === "error" ? problems : warnings).push(`${r.w.path}: ${issue.msg}`);
+        }
+      }
+      if (problems.length > 0) {
+        throw new UserError(`Nothing was committed. Validation failed:\n${problems.slice(0, 5).map((p) => `- ${p}`).join("\n")}`);
+      }
 
       for (const m of moves) {
         const cur = byPath.get(m.from);
@@ -374,6 +512,7 @@ export const tools: ToolDef[] = [
       else await gh.request("PATCH", `/git/refs/heads/${encPath(branch)}`, { sha: commit.sha, force: false });
 
       const lines = [`Committed ${commit.sha.slice(0, 7)} to ${branch}${isNew ? ` (new branch from ${cfg.defaultBranch})` : ""}:`, ...report];
+      if (warnings.length > 0) lines.push("Warnings:", ...warnings.map((w) => `- ${w}`));
       if (pr) {
         try {
           lines.push(await openPr(gh, cfg, branch, pr));
