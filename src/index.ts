@@ -63,7 +63,7 @@ async function handleRpc(msg: Rpc, env: Env, cfg: Config, who: string): Promise<
           protocolVersion: version,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: "github-mcp-secure", version: "1.0.0" },
-          instructions: `Restricted GitHub access to ${cfg.repo}. You can read files, create branches starting with "${cfg.prefix}", commit to them, and open pull requests into ${cfg.defaultBranch}. You cannot merge or change CI/workflow files; a human reviews every PR.`,
+          instructions: `Restricted GitHub access to ${cfg.repo}. You can read files, create branches starting with "${cfg.prefix}", commit to them, and open pull requests into ${cfg.defaultBranch}. You cannot merge or change CI/workflow files; a human reviews every PR. Token-efficient workflow: find code with grep, read only what you need with file_get (start_line/end_line, or paths for several files), then change files with ONE push_files call using edits (patches), create_branch and pr; its result lists what changed, so no read-back is needed.`,
         },
       };
     }
