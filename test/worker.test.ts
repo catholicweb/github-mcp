@@ -115,7 +115,7 @@ test("valid token works; unknown origin and non-POST are refused; missing config
   const ok = await rpc("tools/list", {});
   assert.equal(ok.status, 200);
   const names = ((await ok.json()) as any).result.tools.map((t: any) => t.name).sort();
-  assert.deepEqual(names, ["branch_create", "branches_list", "file_get", "pr_create", "pr_get", "prs_list", "push_files", "repo_tree"]);
+  assert.deepEqual(names, ["branch_create", "branches_list", "file_get", "grep", "pr_create", "pr_get", "prs_list", "push_files", "repo_tree"]);
   assert.ok(!names.some((n: string) => /merge|delete|api|graphql|workflow/.test(n)));
 
   assert.equal((await rpc("tools/list", {}, { origin: "https://evil.example" })).status, 403);

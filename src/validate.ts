@@ -128,3 +128,44 @@ export function asObject(v: unknown, label: string): Record<string, unknown> {
 export function truncate(text: string, max = 60_000): string {
   return text.length <= max ? text : text.slice(0, max) + `\n\n[truncated: ${text.length - max} more chars]`;
 }
+
+// --- content checks ---------------------------------------------------------
+
+export interface ContentIssue {
+  level: "error" | "warn";
+  msg: string;
+}
+
+/** JSON files that commonly allow comments (JSONC): a parse failure is only a warning. */
+const JSONC_FILE = /(?:^|\/)(?:[tj]sconfig[^/]*\.json|\.eslintrc\.json|\.vscode\/[^/]+\.json)$/i;
+
+function parsesAsJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Cheap, dependency-free sanity checks run on every file a commit would write, so the
+ * caller does not need a read-back round trip. Add checks here (keep them false-positive free).
+ * `original` is the previous content when known: a file that was already broken only warns.
+ */
+export function checkContent(path: string, content: string, original?: string): ContentIssue[] {
+  const out: ContentIssue[] = [];
+  if (content.includes("\u0000")) out.push({ level: "error", msg: "contains a NUL byte" });
+  if (/\.json$/i.test(path) && !parsesAsJson(content)) {
+    let detail = "invalid JSON";
+    try {
+      JSON.parse(content);
+    } catch (e) {
+      detail = `invalid JSON (${(e as Error).message.slice(0, 160)})`;
+    }
+    const lenient = JSONC_FILE.test(path) || (original !== undefined && !parsesAsJson(original));
+    out.push({ level: lenient ? "warn" : "error", msg: detail });
+  }
+  if (/^<{7} /m.test(content) && /^>{7} /m.test(content)) out.push({ level: "warn", msg: "contains merge conflict markers" });
+  return out;
+}
