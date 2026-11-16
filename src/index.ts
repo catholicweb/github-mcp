@@ -1,14 +1,16 @@
 import { verifyAccessJwt, normalizeTeamDomain } from "./access.ts";
 import { GitHub } from "./github.ts";
-import { tools, type Config } from "./tools.ts";
-import { UserError, asObject } from "./validate.ts";
+import { tools, reposListTool, type Config, type ServerCfg } from "./tools.ts";
+import { UserError, asObject, validateRepoName } from "./validate.ts";
 
 export interface Env {
   GITHUB_TOKEN: string; // secret
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_AUD: string;
-  ALLOWED_REPO: string;
-  DEFAULT_BRANCH?: string;
+  /** Comma-separated owner/name list, or "*" for every repo the token can write to. */
+  ALLOWED_REPOS?: string;
+  /** Legacy single-repo setting (still honoured if ALLOWED_REPOS is unset). */
+  ALLOWED_REPO?: string;
   BRANCH_PREFIX?: string;
   ALLOWED_EMAIL?: string;
 }
@@ -36,18 +38,54 @@ function rpcError(id: Rpc["id"], code: number, message: string) {
   return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
 }
 
-function loadConfig(env: Env): Config {
-  const repo = env.ALLOWED_REPO;
+function loadConfig(env: Env): ServerCfg {
+  const raw = (env.ALLOWED_REPOS ?? env.ALLOWED_REPO ?? "").trim();
   const prefix = env.BRANCH_PREFIX || "claude/";
-  if (!repo || repo === "OWNER/REPO") throw new Error("ALLOWED_REPO not configured");
+  if (!raw || raw.includes("OWNER/REPO")) throw new Error("ALLOWED_REPOS not configured");
   if (!env.GITHUB_TOKEN) throw new Error("GITHUB_TOKEN secret not set");
   if (!env.ACCESS_AUD || env.ACCESS_AUD.startsWith("TODO")) throw new Error("ACCESS_AUD not configured");
   normalizeTeamDomain(env.ACCESS_TEAM_DOMAIN ?? ""); // throws if invalid
   if (!/^[A-Za-z0-9._-]+\/$/.test(prefix)) throw new Error("BRANCH_PREFIX must look like 'claude/'");
-  return { repo, defaultBranch: env.DEFAULT_BRANCH || "main", prefix };
+  const repos: string[] | "*" =
+    raw === "*" ? "*" : raw.split(",").map((r) => validateRepoName(r.trim(), "ALLOWED_REPOS entry"));
+  return { repos, prefix };
 }
 
-async function handleRpc(msg: Rpc, env: Env, cfg: Config, who: string): Promise<unknown | null> {
+/** Decide which repo a tool call targets, enforcing the allowlist. */
+function resolveRepo(arg: unknown, cfg: ServerCfg): string {
+  let repo: string;
+  if (arg === undefined || arg === null) {
+    if (cfg.repos !== "*" && cfg.repos.length === 1) repo = cfg.repos[0]!;
+    else throw new UserError("repo: required (owner/name). Use repos_list to see which repositories are available.");
+  } else {
+    repo = validateRepoName(arg);
+  }
+  if (cfg.repos !== "*" && !cfg.repos.some((r) => r.toLowerCase() === repo.toLowerCase())) {
+    throw new UserError(`repo: "${repo}" is not in this server's allowlist`);
+  }
+  return repo;
+}
+
+/** Advertise the `repo` argument on every repo-scoped tool. */
+function withRepoProp(schema: Record<string, unknown>, cfg: ServerCfg): Record<string, unknown> {
+  const single = cfg.repos !== "*" && cfg.repos.length === 1;
+  const props = (schema.properties ?? {}) as Record<string, unknown>;
+  const req = ((schema.required as string[] | undefined) ?? []).slice();
+  if (!single) req.unshift("repo");
+  return {
+    ...schema,
+    properties: {
+      repo: {
+        type: "string",
+        description: single ? `owner/name; defaults to ${(cfg.repos as string[])[0]}` : "Repository as owner/name (see repos_list).",
+      },
+      ...props,
+    },
+    ...(req.length ? { required: req } : {}),
+  };
+}
+
+async function handleRpc(msg: Rpc, env: Env, cfg: ServerCfg, who: string): Promise<unknown | null> {
   if (msg === null || typeof msg !== "object" || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
     return rpcError(msg?.id, -32600, "Invalid Request");
   }
@@ -63,7 +101,7 @@ async function handleRpc(msg: Rpc, env: Env, cfg: Config, who: string): Promise<
           protocolVersion: version,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: "github-mcp-secure", version: "1.0.0" },
-          instructions: `Restricted GitHub access to ${cfg.repo}. You can read files, create branches starting with "${cfg.prefix}", commit to them, and open pull requests into ${cfg.defaultBranch}. You cannot merge or change CI/workflow files; a human reviews every PR. Token-efficient workflow: find code with grep, read only what you need with file_get (start_line/end_line, or paths for several files), then change files with ONE push_files call using edits (patches), create_branch and pr; its result lists what changed, so no read-back is needed.`,
+          instructions: `Restricted GitHub access to ${cfg.repos === "*" ? "the repositories the token can write to" : cfg.repos.join(", ")} (call repos_list). You can read files, create branches starting with "${cfg.prefix}", commit to them, and open pull requests into each repo's default branch. You cannot merge or change CI/workflow files; a human reviews every PR. Token-efficient workflow: find code with grep, read only what you need with file_get (start_line/end_line, or paths for several files), then change files with ONE push_files call using edits (patches), create_branch and pr; its result lists what changed, so no read-back is needed.`,
         },
       };
     }
@@ -73,28 +111,49 @@ async function handleRpc(msg: Rpc, env: Env, cfg: Config, who: string): Promise<
       return {
         jsonrpc: "2.0",
         id: msg.id,
-        result: { tools: tools.map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema, annotations })) },
+        result: {
+          tools: [
+            { name: reposListTool.name, description: reposListTool.description, inputSchema: reposListTool.inputSchema, annotations: reposListTool.annotations },
+            ...tools.map(({ name, description, inputSchema, annotations }) => ({
+              name,
+              description,
+              inputSchema: withRepoProp(inputSchema, cfg),
+              annotations,
+            })),
+          ],
+        },
       };
     case "tools/call": {
       const p = asObject(msg.params ?? {}, "params");
-      const tool = tools.find((t) => t.name === p.name);
-      if (!tool) return rpcError(msg.id, -32602, "Unknown tool");
+      const isList = p.name === reposListTool.name;
+      const tool = isList ? undefined : tools.find((t) => t.name === p.name);
+      if (!isList && !tool) return rpcError(msg.id, -32602, "Unknown tool");
+      const toolName = isList ? reposListTool.name : tool!.name;
       const started = Date.now();
       let ok = true;
       let text: string;
+      let repoForLog = "-";
       try {
         const args = p.arguments === undefined ? {} : asObject(p.arguments, "arguments");
-        text = await tool.run(new GitHub(env.GITHUB_TOKEN, cfg.repo), cfg, args);
+        if (isList) {
+          text = await reposListTool.run(new GitHub(env.GITHUB_TOKEN), cfg);
+        } else {
+          const repo = resolveRepo(args.repo, cfg);
+          repoForLog = repo;
+          const gh = new GitHub(env.GITHUB_TOKEN, repo);
+          const repoCfg: Config = { repo, defaultBranch: await gh.defaultBranch(), prefix: cfg.prefix };
+          text = await tool!.run(gh, repoCfg, args);
+        }
       } catch (e) {
         ok = false;
         if (e instanceof UserError) text = e.message;
         else {
-          console.error(JSON.stringify({ evt: "tool_error", tool: tool.name, err: String(e) }));
+          console.error(JSON.stringify({ evt: "tool_error", tool: toolName, err: String(e) }));
           text = "Internal error (details logged server-side).";
         }
       }
       // Audit log: who, what, outcome. Never log file contents or tokens.
-      console.log(JSON.stringify({ evt: "tool_call", tool: tool.name, who, ok, ms: Date.now() - started }));
+      console.log(JSON.stringify({ evt: "tool_call", tool: toolName, repo: repoForLog, who, ok, ms: Date.now() - started }));
       return { jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text }], ...(ok ? {} : { isError: true }) } };
     }
     default:
@@ -110,7 +169,7 @@ export default {
     if (request.method !== "POST") return reply(405, { error: "method not allowed" }, { allow: "POST" });
 
     // 1. Config must be complete, otherwise refuse everything.
-    let cfg: Config;
+    let cfg: ServerCfg;
     try {
       cfg = loadConfig(env);
     } catch (e) {

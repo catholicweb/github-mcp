@@ -29,6 +29,11 @@ export interface ToolDef {
   run: (gh: GitHub, cfg: Config, args: Record<string, unknown>) => Promise<string>;
 }
 
+export interface ServerCfg {
+  repos: string[] | "*";
+  prefix: string;
+}
+
 const MAX_FILES = 50;
 const MAX_FILE_CHARS = 200_000;
 const MAX_TOTAL_CHARS = 1_000_000;
@@ -604,3 +609,16 @@ export const tools: ToolDef[] = [
 ];
 
 export { GitHubError };
+
+/** Account-level tool: which repositories this server (and its token) can write to. */
+export const reposListTool = {
+  name: "repos_list",
+  description: "List the repositories this connector can work on (with their default branch). Use the full_name as the `repo` argument of other tools.",
+  inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  annotations: readOnly,
+  async run(gh: GitHub, cfg: ServerCfg): Promise<string> {
+    const all = await gh.listWritableRepos();
+    const allowed = cfg.repos === "*" ? all : all.filter((r) => (cfg.repos as string[]).some((a) => a.toLowerCase() === r.full_name.toLowerCase()));
+    return json(allowed.map((r) => ({ repo: r.full_name, default_branch: r.default_branch, private: r.private, archived: r.archived })));
+  },
+};

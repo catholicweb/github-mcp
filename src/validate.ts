@@ -37,6 +37,17 @@ export function validateWritableBranch(
   return b;
 }
 
+/** owner/name. Rejects "." / ".." so a repo name can never rewrite the API URL path. */
+export function validateRepoName(v: unknown, label = "repo"): string {
+  if (typeof v !== "string" || v.length > 140 || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(v)) {
+    throw new UserError(`${label}: must look like owner/name`);
+  }
+  for (const part of v.split("/")) {
+    if (part === "." || part === "..") throw new UserError(`${label}: invalid repository name`);
+  }
+  return v;
+}
+
 // --- file path policy -------------------------------------------------------
 
 /** Top-level directories that can execute code or change repo governance. */

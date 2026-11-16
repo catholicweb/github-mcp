@@ -6,14 +6,15 @@ import { validateFilePath, validateWritableBranch, UserError } from "../src/vali
 
 const TEAM = "https://acme.cloudflareaccess.com";
 const AUD = "aud-tag-123";
-const env = {
+const baseEnv: Record<string, string> = {
   GITHUB_TOKEN: "ghp_test_token",
   ACCESS_TEAM_DOMAIN: TEAM,
   ACCESS_AUD: AUD,
-  ALLOWED_REPO: "me/repo",
-  DEFAULT_BRANCH: "main",
+  ALLOWED_REPO: "me/repo", // legacy single-repo setting must keep working
   BRANCH_PREFIX: "claude/",
 };
+let env: Record<string, string> = { ...baseEnv };
+const defaultBranches: Record<string, string> = {};
 
 // --- JWT helpers ------------------------------------------------------------
 const b64u = (b: ArrayBuffer | Uint8Array | string) =>
@@ -46,6 +47,8 @@ let github: (c: Call) => { status?: number; body: unknown } = () => ({ status: 4
 
 beforeEach(() => {
   calls = [];
+  env = { ...baseEnv };
+  for (const k of Object.keys(defaultBranches)) delete defaultBranches[k];
   resetAccessCache();
   github = () => ({ status: 404, body: { message: "Not Found" } });
   globalThis.fetch = (async (input: any, init: any = {}) => {
@@ -60,6 +63,10 @@ beforeEach(() => {
     };
     calls.push(call);
     if (!url.startsWith("https://api.github.com/")) throw new Error(`unexpected outbound fetch: ${url}`);
+    const root = url.match(/^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)$/);
+    if (root && call.method === "GET") {
+      return Response.json({ default_branch: defaultBranches[root[1]!.toLowerCase()] ?? "main" });
+    }
     const r = github(call);
     return Response.json(r.body, { status: r.status ?? 200 });
   }) as typeof fetch;
@@ -115,7 +122,7 @@ test("valid token works; unknown origin and non-POST are refused; missing config
   const ok = await rpc("tools/list", {});
   assert.equal(ok.status, 200);
   const names = ((await ok.json()) as any).result.tools.map((t: any) => t.name).sort();
-  assert.deepEqual(names, ["branch_create", "branches_list", "file_get", "grep", "pr_create", "pr_get", "prs_list", "push_files", "repo_tree"]);
+  assert.deepEqual(names, ["branch_create", "branches_list", "file_get", "grep", "pr_create", "pr_get", "prs_list", "push_files", "repo_tree", "repos_list"]);
   assert.ok(!names.some((n: string) => /merge|delete|api|graphql|workflow/.test(n)));
 
   assert.equal((await rpc("tools/list", {}, { origin: "https://evil.example" })).status, 403);
@@ -157,7 +164,8 @@ test("push_files refuses protected targets before any GitHub call", async () => 
     const r = await call("push_files", args);
     assert.equal(r.isError, true, JSON.stringify(args));
   }
-  assert.equal(calls.length, 0);
+  assert.ok(calls.every((c) => c.method === "GET"), "no write calls may happen");
+  assert.ok(!calls.some((c) => c.url.includes("/git/")), "validation must fail before touching git data");
 });
 
 test("push_files happy path: one commit, fast-forward only, token only goes to api.github.com", async () => {
@@ -202,6 +210,66 @@ test("pr_create always targets the default branch and never merges", async () =>
   assert.equal(post.body.base, "main");
   assert.equal(post.body.head, "claude/x");
   assert.ok(!calls.some((c) => c.url.includes("/merge")));
+});
+
+test("multi-repo: allowlist is enforced before any GitHub call", async () => {
+  env.ALLOWED_REPOS = "me/a, me/b";
+  delete env.ALLOWED_REPO;
+  const listed: any = await (await rpc("tools/list", {})).json();
+  const rt = listed.result.tools.find((t: any) => t.name === "repo_tree");
+  assert.deepEqual(rt.inputSchema.required, ["repo"]);
+
+  for (const repo of ["me/c", "evil/a", "me/..", "../x", "me/a/../b", "ME", "", undefined]) {
+    const r = await call("repo_tree", repo === undefined ? {} : { repo });
+    assert.equal(r.isError, true, String(repo));
+  }
+  assert.equal(calls.length, 0);
+
+  // allowed, case-insensitive
+  github = (c) => (c.url.includes("/git/ref/heads/main") ? { body: { object: { sha: "c0" } } } : c.url.includes("/git/commits/c0") ? { body: { sha: "c0", tree: { sha: "t0" } } } : { body: { truncated: false, tree: [] } });
+  const ok = await call("repo_tree", { repo: "ME/B" });
+  assert.equal(ok.isError, false, ok.text);
+  assert.ok(calls.every((c) => c.url.toLowerCase().startsWith("https://api.github.com/repos/me/b")));
+});
+
+test('multi-repo: "*" allows any repo the token reaches, still rejects traversal', async () => {
+  env.ALLOWED_REPOS = "*";
+  github = () => ({ status: 404, body: { message: "Not Found" } });
+  await call("repo_tree", { repo: "other/thing" });
+  assert.ok(calls.length > 0 && calls.every((c) => c.url.startsWith("https://api.github.com/repos/other/thing")));
+  calls = [];
+  for (const repo of ["a/..", "../b", "a/b/c", "a b/c"]) assert.equal((await call("repo_tree", { repo })).isError, true, repo);
+  assert.equal(calls.length, 0);
+});
+
+test("multi-repo: each repo's own default branch is the PR base", async () => {
+  env.ALLOWED_REPOS = "me/a,me/b";
+  defaultBranches["me/b"] = "master";
+  github = (c) => (c.method === "POST" && c.url.endsWith("/pulls") ? { body: { number: 3, html_url: "https://github.com/me/b/pull/3" } } : { status: 404, body: { message: "nf" } });
+  const r = await call("pr_create", { repo: "me/b", head: "claude/x", title: "t" });
+  assert.equal(r.isError, false, r.text);
+  assert.equal(calls.find((c) => c.url.endsWith("/pulls"))!.body.base, "master");
+  // a repo whose default branch is literally named like a working branch can never be written
+  defaultBranches["me/a"] = "claude/trunk";
+  const w = await call("push_files", { repo: "me/a", branch: "claude/trunk", message: "m", files: [{ path: "a.txt", content: "x" }] });
+  assert.equal(w.isError, true);
+});
+
+test("repos_list shows only writable repos inside the allowlist", async () => {
+  github = (c) =>
+    c.url.startsWith("https://api.github.com/user/repos")
+      ? { body: [
+          { full_name: "me/repo", default_branch: "main", private: true, archived: false, permissions: { push: true } },
+          { full_name: "me/readonly", default_branch: "main", private: false, archived: false, permissions: { push: false } },
+          { full_name: "me/other", default_branch: "main", private: false, archived: false, permissions: { push: true } },
+        ] }
+      : { status: 404, body: { message: "nf" } };
+  const r = await call("repos_list", {});
+  assert.equal(r.isError, false);
+  assert.deepEqual(JSON.parse(r.text).map((x: any) => x.repo), ["me/repo"]); // legacy ALLOWED_REPO=me/repo
+  env.ALLOWED_REPOS = "*";
+  const all = JSON.parse((await call("repos_list", {})).text).map((x: any) => x.repo);
+  assert.deepEqual(all, ["me/repo", "me/other"]); // read-only repos never listed
 });
 
 test("GitHub errors never leak the token, and redirects are refused", async () => {

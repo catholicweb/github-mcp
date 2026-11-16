@@ -5,7 +5,7 @@ It lets Claude **propose** changes to **one repository** and nothing else.
 
 | Claude can | Claude cannot |
 |---|---|
-| Read files / list the tree of the one allowed repo | Touch any other repo |
+| Read files / list the tree of the allowed repos | Touch any repo outside the allowlist |
 | Create branches named `claude/*` | Write to `main` or any non-`claude/*` branch |
 | Commit to `claude/*` branches (fast-forward only, never force) | Merge, close, delete branches, or approve PRs |
 | Open PRs into `main` | Edit `.github/`, CODEOWNERS, CI configs, `.git*` files |
@@ -17,7 +17,7 @@ A human (you) reviews and merges every PR on GitHub.
 
 1. **Cloudflare Access (Managed OAuth)** in front of the hostname. Only your email gets in; access tokens last 15 minutes; the grant lasts 7 days; only Claude's callback URLs may register.
 2. **The Worker re-verifies the Access JWT itself** (RS256 signature against your team's keys, issuer, audience, expiry; optional email pin). `workers.dev` and preview URLs are disabled, so there is no side door.
-3. **Hard-coded scope**: repo, base branch and branch prefix come from config, never from tool arguments.
+3. **Fixed scope**: the repo allowlist and branch prefix come from config. The `repo` argument of a tool call is checked against the allowlist (and against path tricks like `owner/..`) before any GitHub request is made; each PR's base is that repo's own default branch.
 4. **Path policy**: CI/workflow/governance files are refused (list in `src/validate.ts`).
 5. **GitHub fine-grained token** limited to one repo and three permissions.
 6. **GitHub ruleset on `main`** requiring a reviewed PR. This is the control that still holds if everything above has a bug.
@@ -39,7 +39,7 @@ Prereqs: Node 22+, a domain whose DNS is on your Cloudflare account, Zero Trust 
 GitHub -> Settings -> Developer settings -> Fine-grained tokens -> Generate:
 
 - **Resource owner:** you / your org
-- **Repository access:** *Only select repositories* -> the one repo
+- **Repository access:** *Only select repositories* -> only the repos you want Claude to work on (best: create this token under a separate machine-user account, see below)
 - **Permissions:** Contents: **Read and write**, Pull requests: **Read and write**, Metadata: Read-only. **Nothing else.** (Do not grant Actions, Workflows or Administration.)
 - **Expiration:** 30-90 days. Put a reminder in your calendar.
 
@@ -73,7 +73,7 @@ Edit `wrangler.jsonc`:
 - `routes[0].pattern` -> your hostname (same as `MCP_HOST`)
 - `ACCESS_TEAM_DOMAIN` -> `https://<your-team>.cloudflareaccess.com` (Zero Trust -> Settings)
 - `ACCESS_AUD` -> value from step 3
-- `ALLOWED_REPO` -> `owner/repo`
+- `ALLOWED_REPOS` -> comma-separated `owner/repo` list, e.g. `me/site,me/api` (or `*`, see *Multiple repositories*)
 - optional: uncomment `ALLOWED_EMAIL` (only if your Access JWTs carry an email claim; test it)
 
 Then:
@@ -103,6 +103,15 @@ Claude (web) -> Settings -> Connectors -> Add custom connector -> URL `https://g
 
 Afterwards, in the connector's tool permissions, set the write tools (`branch_create`, `push_files`, `pr_create`) to **require approval** rather than always-allow. The connector then works from the phone app too.
 
+## Multiple repositories
+
+Every repo-scoped tool takes a `repo` argument (`owner/name`); `repos_list` shows what is available. If exactly one repo is allowed, `repo` is optional.
+
+- `ALLOWED_REPOS="me/site,me/api"` -- explicit allowlist (recommended). It stays a hard limit even if the token's access is widened later by accident.
+- `ALLOWED_REPOS="*"` -- any repo the token can write to. Then the **token is your only boundary**, so keep it on a machine user with access to just the repos you want.
+- Each repo needs its **own `main` ruleset** (import `ruleset-main-*.json` per repo, or use an organization-level ruleset if the repos live in an org). Default branches may differ per repo; `~DEFAULT_BRANCH` in the ruleset handles that.
+- The legacy `ALLOWED_REPO` setting still works for a single repo.
+
 ## Day-to-day
 
 - Review and merge PRs on GitHub (the mobile app is fine).
@@ -113,7 +122,7 @@ Afterwards, in the connector's tool permissions, set the write tools (`branch_cr
 
 ## Tools
 
-`repo_tree`, `file_get`, `grep`, `branches_list`, `branch_create`, `push_files`, `pr_create`, `prs_list`, `pr_get`.
+`repos_list`, `repo_tree`, `file_get`, `grep`, `branches_list`, `branch_create`, `push_files`, `pr_create`, `prs_list`, `pr_get`.
 
 Token-saving helpers for an AI client:
 
@@ -123,4 +132,4 @@ Token-saving helpers for an AI client:
 
 ## Tuning the restrictions
 
-All in `src/validate.ts` (blocked directories/file names) and `wrangler.jsonc` (`BRANCH_PREFIX`, `DEFAULT_BRANCH`). If you want to widen anything, do it consciously and re-run `npm test`.
+All in `src/validate.ts` (blocked directories/file names) and `wrangler.jsonc` (`ALLOWED_REPOS`, `BRANCH_PREFIX`). If you want to widen anything, do it consciously and re-run `npm test`.

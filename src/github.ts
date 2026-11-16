@@ -1,4 +1,4 @@
-import { UserError } from "./validate.ts";
+import { UserError, validateRepoName } from "./validate.ts";
 
 const API = "https://api.github.com";
 
@@ -39,13 +39,25 @@ export function encPath(p: string): string {
  * token cannot be sent anywhere else.
  */
 export class GitHub {
-  private base: string;
+  private base: string | null;
   private token: string;
 
-  constructor(token: string, repo: string) {
-    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new Error("ALLOWED_REPO must be owner/name");
+  /** repo = owner/name for repo-scoped calls; omit for account-level calls (repos_list). */
+  constructor(token: string, repo?: string) {
     this.token = token;
-    this.base = `/repos/${repo}`;
+    this.base = repo === undefined ? null : `/repos/${validateRepoName(repo)}`;
+  }
+
+  async defaultBranch(): Promise<string> {
+    const r = await this.request<{ default_branch: string }>("GET", "");
+    return r.default_branch;
+  }
+
+  async listWritableRepos(): Promise<{ full_name: string; default_branch: string; private: boolean; archived: boolean }[]> {
+    const list = await this.request<
+      { full_name: string; default_branch: string; private: boolean; archived: boolean; permissions?: { push?: boolean } }[]
+    >("GET", "/user/repos?per_page=100&sort=updated", undefined, "application/vnd.github+json", true);
+    return list.filter((r) => r.permissions?.push === true);
   }
 
   async request<T = unknown>(
@@ -53,8 +65,10 @@ export class GitHub {
     path: string,
     body?: unknown,
     accept = "application/vnd.github+json",
+    root = false,
   ): Promise<T> {
-    const res = await fetch(`${API}${this.base}${path}`, {
+    if (!root && this.base === null) throw new Error("repo-scoped request without a repo");
+    const res = await fetch(`${API}${root ? "" : this.base}${path}`, {
       method,
       redirect: "manual",
       signal: AbortSignal.timeout(20_000),
