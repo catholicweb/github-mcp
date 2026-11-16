@@ -79,7 +79,7 @@ async function openPr(gh: GitHub, cfg: Config, head: string, pr: PrInput): Promi
   return `Opened PR #${created.number}: ${created.html_url}`;
 }
 
-const GREP_MAX_FILES = 120; // each scanned file costs one GitHub subrequest
+const GREP_MAX_FILES = 40; // each scanned file costs one GitHub subrequest
 const GREP_MAX_FILE_BYTES = 200_000;
 const GREP_SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|bmp|pdf|zip|gz|tgz|tar|7z|woff2?|ttf|otf|eot|mp[34]|mov|avi|wasm|bin|exe|dll|so|dylib|class|jar|psd|sqlite3?)$/i;
 const GREP_SKIP_LOCK = /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|composer\.lock|poetry\.lock|Gemfile\.lock)$/;
