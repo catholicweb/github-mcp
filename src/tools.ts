@@ -79,6 +79,25 @@ async function openPr(gh: GitHub, cfg: Config, head: string, pr: PrInput): Promi
   return `Opened PR #${created.number}: ${created.html_url}`;
 }
 
+/** CI status of a commit (check runs + legacy statuses). Best effort: the token may lack checks/statuses read. */
+async function getChecks(gh: GitHub, sha: string): Promise<unknown> {
+  try {
+    const [runs, combined] = await Promise.all([
+      gh.request<{ check_runs: { name: string; status: string; conclusion: string | null }[] }>("GET", `/commits/${sha}/check-runs?per_page=50`),
+      gh.request<{ state: string; statuses: { context: string; state: string }[] }>("GET", `/commits/${sha}/status`),
+    ]);
+    const items = [
+      ...runs.check_runs.map((c) => ({ name: c.name, result: c.status === "completed" ? (c.conclusion ?? "completed") : c.status })),
+      ...combined.statuses.map((c) => ({ name: c.context, result: c.state })),
+    ];
+    const bad = items.filter((i) => !["success", "neutral", "skipped"].includes(i.result));
+    const state = items.length === 0 ? "none" : bad.some((i) => ["failure", "error", "cancelled", "timed_out", "action_required"].includes(i.result)) ? "failing" : bad.length ? "pending" : "passing";
+    return { state, items: items.slice(0, 30) };
+  } catch (e) {
+    return `unavailable (${e instanceof GitHubError && (e.status === 403 || e.status === 404) ? "token cannot read checks; add Checks: read and Commit statuses: read" : "lookup failed"})`;
+  }
+}
+
 const GREP_MAX_FILES = 40; // each scanned file costs one GitHub subrequest
 const GREP_MAX_FILE_BYTES = 200_000;
 const GREP_SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|bmp|pdf|zip|gz|tgz|tar|7z|woff2?|ttf|otf|eot|mp[34]|mov|avi|wasm|bin|exe|dll|so|dylib|class|jar|psd|sqlite3?)$/i;
@@ -185,7 +204,8 @@ export const tools: ToolDef[] = [
     name: "grep",
     description:
       `Search file contents on a branch with a regex (or literal text). Returns "path:line:text" matches, with optional context lines, so you rarely need to read whole files. ` +
-      `Scans at most ${GREP_MAX_FILES} text files (binary, >200 KB and lock files are skipped); narrow with path_prefix or glob.`,
+      `Scans at most ${GREP_MAX_FILES} text files per call (binary, >200 KB and lock files are skipped). When more files match the filters the result starts with "PARTIAL": ` +
+      `narrow with path_prefix/glob or continue with offset. For repo-wide questions prefer a narrow path_prefix, or clone the repo if you have a sandbox.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -197,6 +217,7 @@ export const tools: ToolDef[] = [
         ignore_case: { type: "boolean" },
         context: { type: "integer", minimum: 0, maximum: 5, description: "Lines of context around each match (default 0)." },
         max_results: { type: "integer", minimum: 1, maximum: 200, description: "Default 50." },
+        offset: { type: "integer", minimum: 0, description: "Skip the first N candidate files (sorted by path). Use the value from a PARTIAL result to continue." },
       },
       required: ["pattern"],
       additionalProperties: false,
@@ -235,7 +256,8 @@ export const tools: ToolDef[] = [
           return !skip;
         })
         .sort((x, y) => (x.path < y.path ? -1 : 1));
-      const scanList = candidates.slice(0, GREP_MAX_FILES);
+      const offset = optInt(a.offset, "offset", 0, 1_000_000, 0);
+      const scanList = candidates.slice(offset, offset + GREP_MAX_FILES);
 
       const out: string[] = [];
       let matches = 0;
@@ -261,10 +283,14 @@ export const tools: ToolDef[] = [
 
       const notes: string[] = [];
       if (matches >= max) notes.push("stopped at max_results");
-      if (candidates.length > GREP_MAX_FILES) notes.push(`only the first ${GREP_MAX_FILES} of ${candidates.length} files were scanned; narrow with path_prefix or glob`);
+      const next = offset + scanList.length;
+      const unscanned = candidates.length - next;
+      if (unscanned > 0 && matches < max) notes.push(`files ${offset + 1}-${next} of ${candidates.length} were scanned; ${unscanned} not scanned. Narrow with path_prefix/glob or continue with offset=${next}`);
+      if (offset > 0) notes.push(`started at file ${offset + 1}`);
       if (skipped > 0) notes.push(`${skipped} binary/large/lock files skipped`);
       if (truncated) notes.push("GitHub truncated the tree; narrow with path_prefix");
-      const header = `${matches} match${matches === 1 ? "" : "es"} in ${files} file${files === 1 ? "" : "s"} (scanned ${scanned})${notes.length ? `; ${notes.join("; ")}` : ""}`;
+      const partial = (unscanned > 0 && matches < max) || truncated;
+      const header = `${partial ? "PARTIAL: " : ""}${matches} match${matches === 1 ? "" : "es"} in ${files} file${files === 1 ? "" : "s"} (scanned ${scanned})${notes.length ? `; ${notes.join("; ")}` : ""}`;
       return truncate(out.length ? `${header}\n${out.join("\n")}` : header);
     },
   },
@@ -548,6 +574,38 @@ export const tools: ToolDef[] = [
     },
   },
   {
+    name: "pr_update",
+    description:
+      "Change the title and/or body of an open pull request that comes from a working branch (so a PR opened earlier can be corrected or completed). " +
+      "Cannot merge, close or retarget it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        number: { type: "integer", minimum: 1 },
+        title: { type: "string" },
+        body: { type: "string", description: "Replaces the whole description." },
+      },
+      required: ["number"],
+      additionalProperties: false,
+    },
+    annotations: { ...writeNonDestructive, idempotentHint: true },
+    async run(gh, cfg, a) {
+      const n = optInt(a.number, "number", 1, 10_000_000, 0);
+      if (n === 0) throw new UserError("number: required");
+      const title = a.title === undefined ? undefined : reqString(a.title, "title", 1, 256);
+      const body = a.body === undefined ? undefined : (optString(a.body, "body", 20_000) ?? "");
+      if (title === undefined && body === undefined) throw new UserError("give a title and/or a body");
+      const pr = await gh.request<{ state: string; merged: boolean; head: { ref: string; repo: { full_name: string } | null }; base: { ref: string } }>("GET", `/pulls/${n}`);
+      // Same guard as writes: only PRs from a working branch of this repo into the default branch.
+      if (!pr.head.ref.startsWith(cfg.prefix) || pr.head.repo?.full_name !== cfg.repo || pr.base.ref !== cfg.defaultBranch) {
+        throw new UserError(`PR #${n} is not from a "${cfg.prefix}" branch of ${cfg.repo}; refusing to edit it`);
+      }
+      if (pr.state !== "open") throw new UserError(`PR #${n} is not open`);
+      await gh.request("PATCH", `/pulls/${n}`, { ...(title !== undefined ? { title } : {}), ...(body !== undefined ? { body } : {}) });
+      return `Updated PR #${n}: ${[title !== undefined ? "title" : "", body !== undefined ? "body" : ""].filter(Boolean).join(" + ")}`;
+    },
+  },
+  {
     name: "prs_list",
     description: "List pull requests (default: open).",
     inputSchema: {
@@ -572,7 +630,7 @@ export const tools: ToolDef[] = [
   },
   {
     name: "pr_get",
-    description: "Get a pull request's details and changed files (with truncated patches).",
+    description: "Get a pull request's details, CI check status (checks: state + per-check results, or a note when the token cannot read checks) and changed files (with truncated patches).",
     inputSchema: {
       type: "object",
       properties: { number: { type: "integer", minimum: 1 } },
@@ -585,8 +643,9 @@ export const tools: ToolDef[] = [
       if (n === 0) throw new UserError("number: required");
       const pr = await gh.request<{
         number: number; title: string; body: string | null; state: string; draft: boolean; merged: boolean; mergeable_state?: string;
-        head: { ref: string }; base: { ref: string }; html_url: string;
+        head: { ref: string; sha: string }; base: { ref: string }; html_url: string;
       }>("GET", `/pulls/${n}`);
+      const checks = await getChecks(gh, pr.head.sha);
       const files = await gh.request<{ filename: string; status: string; additions: number; deletions: number; patch?: string }[]>(
         "GET",
         `/pulls/${n}/files?per_page=100`,
@@ -594,7 +653,7 @@ export const tools: ToolDef[] = [
       return truncate(
         json({
           number: pr.number, title: pr.title, state: pr.state, draft: pr.draft, merged: pr.merged,
-          head: pr.head.ref, base: pr.base.ref, url: pr.html_url, mergeable_state: pr.mergeable_state,
+          head: pr.head.ref, base: pr.base.ref, url: pr.html_url, mergeable_state: pr.mergeable_state, checks,
           body: truncate(pr.body ?? "", 5000),
           files: files.map((f) => ({ file: f.filename, status: f.status, additions: f.additions, deletions: f.deletions, patch: truncate(f.patch ?? "", 4000) })),
         }),
