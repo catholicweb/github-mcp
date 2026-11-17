@@ -282,3 +282,10 @@ test("GitHub errors never leak the token, and redirects are refused", async () =
   assert.equal(r2.isError, true);
   assert.match(r2.text, /redirect/);
 });
+
+test("initialize instructions never contain an undefined value", async () => {
+  const res = await rpc("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "1" } });
+  const text = ((await res.json()) as any).result.instructions as string;
+  assert.ok(text.length > 100);
+  assert.ok(!/undefined|\[object/.test(text), text);
+});

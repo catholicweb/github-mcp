@@ -84,3 +84,57 @@ test("pr_update edits title/body of an open working-branch PR only", async () =>
   await assert.rejects(() => tool("pr_update").run(prGh(openPr({ state: "closed" })) as any, cfg, { number: 5, title: "x" }), /not open/);
   await assert.rejects(() => tool("pr_update").run(prGh(openPr()) as any, cfg, { number: 5 }), /title and\/or a body/);
 });
+
+// --- repo_tree: collapse big repos -------------------------------------------
+function treeGh(paths: string[]) {
+  return {
+    async branchHead() {
+      return { commitSha: "c", treeSha: "t" };
+    },
+    async getTree() {
+      return { truncated: false, tree: paths.map((path, i) => ({ path, mode: "100644", type: "blob", sha: `s${i}`, size: 10 })) };
+    },
+  };
+}
+
+test("repo_tree lists small repos in full and collapses big ones to directories", async () => {
+  const small = await tool("repo_tree").run(treeGh(["a.txt", "src/b.ts"]) as any, cfg, {});
+  assert.match(small, /^2 files\n/);
+  assert.match(small, /src\/b\.ts\t10/);
+
+  const big = Array.from({ length: 400 }, (_, i) => `images/comic/f${i}.webp`).concat(["README.md", "src/a/x.ts", "src/a/y.ts"]);
+  const out = await tool("repo_tree").run(treeGh(big) as any, cfg, {});
+  assert.match(out, /^403 files in 3 entries; collapsed to depth 2 because it is big/);
+  assert.match(out, /images\/comic\/\t400 files, 4000 bytes/);
+  assert.match(out, /src\/a\/\t2 files/);
+  assert.match(out, /README\.md\t10/);
+
+  // path_prefix + explicit depth expands one level at a time; a small prefix is listed in full
+  const one = await tool("repo_tree").run(treeGh(big) as any, cfg, { path_prefix: "images/", depth: 1 });
+  assert.match(one, /images\/comic\/\t400 files/);
+  const full = await tool("repo_tree").run(treeGh(big.slice(0, 5).concat(["src/a/x.ts"])) as any, cfg, { path_prefix: "src/" });
+  assert.match(full, /^1 files\nsrc\/a\/x\.ts\t10/);
+});
+
+// --- pr_get: patches only for open PRs by default -----------------------------
+test("pr_get skips patches for merged PRs unless asked", async () => {
+  const files = [{ filename: "a.ts", status: "modified", additions: 1, deletions: 0, patch: "@@ -1 +1 @@\n+x" }];
+  const mk = (pr: any) => ({
+    async request(_m: string, path: string) {
+      if (path === "/pulls/5") return pr;
+      if (path.startsWith("/pulls/5/files")) return files;
+      if (path.includes("/check-runs")) return { check_runs: [] };
+      if (path.endsWith("/status")) return { state: "success", statuses: [] };
+      return {};
+    },
+  });
+  const merged = JSON.parse(await tool("pr_get").run(mk(openPr({ state: "closed", merged: true })) as any, cfg, { number: 5 }));
+  assert.equal(merged.files[0].patch, undefined);
+  assert.equal(merged.files[0].additions, 1);
+  const forced = JSON.parse(await tool("pr_get").run(mk(openPr({ state: "closed", merged: true })) as any, cfg, { number: 5, patches: true }));
+  assert.match(forced.files[0].patch, /\+x/);
+  const open = JSON.parse(await tool("pr_get").run(mk(openPr()) as any, cfg, { number: 5 }));
+  assert.match(open.files[0].patch, /\+x/);
+  const off = JSON.parse(await tool("pr_get").run(mk(openPr()) as any, cfg, { number: 5, patches: false }));
+  assert.equal(off.files[0].patch, undefined);
+});

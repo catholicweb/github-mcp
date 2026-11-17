@@ -103,6 +103,7 @@ async function getChecks(gh: GitHub, sha: string): Promise<unknown> {
   }
 }
 
+const TREE_AUTO_COLLAPSE = 300;
 const GREP_MAX_FILES = 40; // each scanned file costs one GitHub subrequest
 const GREP_MAX_FILE_BYTES = 200_000;
 const GREP_SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|bmp|pdf|zip|gz|tgz|tar|7z|woff2?|ttf|otf|eot|mp[34]|mov|avi|wasm|bin|exe|dll|so|dylib|class|jar|psd|sqlite3?)$/i;
@@ -116,12 +117,15 @@ export const tools: ToolDef[] = [
   {
     name: "repo_tree",
     description:
-      "List files in the repository (recursive) for a branch. Optionally filter by a path prefix. Returns path and size.",
+      "List files in the repository (recursive) for a branch. Optionally filter by a path prefix. Returns path and size. " +
+      `Big repos are collapsed to directories (with file counts) when there are more than ${TREE_AUTO_COLLAPSE} files and no depth/path_prefix is given: ` +
+      "re-run with a path_prefix to expand one directory, or set depth to choose how many path levels to show.",
     inputSchema: {
       type: "object",
       properties: {
         branch: { type: "string", description: "Branch name. Defaults to the repo default branch." },
         path_prefix: { type: "string", description: "Only list paths starting with this prefix." },
+        depth: { type: "integer", minimum: 1, maximum: 20, description: "Show at most this many path levels (below the prefix directory); deeper files collapse into 'dir/  N files, size'." },
       },
       additionalProperties: false,
     },
@@ -131,11 +135,34 @@ export const tools: ToolDef[] = [
       const prefix = optString(a.path_prefix, "path_prefix", 400) ?? "";
       const head = await gh.branchHead(branch);
       const { tree, truncated } = await gh.getTree(head.treeSha);
-      const files = tree
-        .filter((e) => e.type === "blob" && e.path.startsWith(prefix))
-        .slice(0, 3000)
-        .map((e) => `${e.path}\t${e.size ?? 0}`);
-      return `${files.length} files${truncated ? " (GitHub truncated the tree; narrow with path_prefix)" : ""}\n${files.join("\n")}`;
+      const blobs = tree.filter((e) => e.type === "blob" && e.path.startsWith(prefix)).slice(0, 3000);
+      const cut = truncated ? " (GitHub truncated the tree; narrow with path_prefix)" : "";
+      let depth = a.depth === undefined ? undefined : optInt(a.depth, "depth", 1, 20, 1);
+      let auto = false;
+      if (depth === undefined && blobs.length > TREE_AUTO_COLLAPSE) {
+        depth = 2;
+        auto = true;
+      }
+      if (depth === undefined) {
+        return `${blobs.length} files${cut}\n${blobs.map((e) => `${e.path}\t${e.size ?? 0}`).join("\n")}`;
+      }
+      // Collapse everything deeper than `depth` levels (counted below the prefix's directory) into one line per directory.
+      const base = prefix.slice(0, prefix.lastIndexOf("/") + 1);
+      const lines = new Map<string, { n: number; bytes: number } | number>();
+      for (const e of blobs) {
+        const segs = e.path.slice(base.length).split("/");
+        if (segs.length <= depth) lines.set(e.path, e.size ?? 0);
+        else {
+          const dir = `${base}${segs.slice(0, depth).join("/")}/`;
+          const cur = (lines.get(dir) as { n: number; bytes: number } | undefined) ?? { n: 0, bytes: 0 };
+          cur.n++;
+          cur.bytes += e.size ?? 0;
+          lines.set(dir, cur);
+        }
+      }
+      const out = [...lines].map(([k, v]) => (typeof v === "number" ? `${k}\t${v}` : `${k}\t${v.n} files, ${v.bytes} bytes`));
+      const note = auto ? `; collapsed to depth ${depth} because it is big: pass path_prefix to expand a directory or depth to change this` : `; depth ${depth}`;
+      return `${blobs.length} files in ${out.length} entries${note}${cut}\n${out.join("\n")}`;
     },
   },
   {
@@ -635,10 +662,15 @@ export const tools: ToolDef[] = [
   },
   {
     name: "pr_get",
-    description: "Get a pull request's details, CI check status (checks: state + per-check results, or a note when the token cannot read checks) and changed files (with truncated patches).",
+    description:
+      "Get a pull request's details, CI check status (checks: state + per-check results, or a note when the token cannot read checks) and changed files. " +
+      "Patches (truncated) are included for open PRs; for closed/merged PRs only per-file stats unless patches: true. Set patches: false to skip them on a big open PR.",
     inputSchema: {
       type: "object",
-      properties: { number: { type: "integer", minimum: 1 } },
+      properties: {
+        number: { type: "integer", minimum: 1 },
+        patches: { type: "boolean", description: "Include each file's patch. Default: true for open PRs, false for closed/merged ones." },
+      },
       required: ["number"],
       additionalProperties: false,
     },
@@ -651,6 +683,7 @@ export const tools: ToolDef[] = [
         head: { ref: string; sha: string }; base: { ref: string }; html_url: string;
       }>("GET", `/pulls/${n}`);
       const checks = await getChecks(gh, pr.head.sha);
+      const withPatches = typeof a.patches === "boolean" ? a.patches : pr.state === "open";
       const files = await gh.request<{ filename: string; status: string; additions: number; deletions: number; patch?: string }[]>(
         "GET",
         `/pulls/${n}/files?per_page=100`,
@@ -660,7 +693,10 @@ export const tools: ToolDef[] = [
           number: pr.number, title: pr.title, state: pr.state, draft: pr.draft, merged: pr.merged,
           head: pr.head.ref, base: pr.base.ref, url: pr.html_url, mergeable_state: pr.mergeable_state, checks,
           body: truncate(pr.body ?? "", 5000),
-          files: files.map((f) => ({ file: f.filename, status: f.status, additions: f.additions, deletions: f.deletions, patch: truncate(f.patch ?? "", 4000) })),
+          files: files.map((f) => ({
+            file: f.filename, status: f.status, additions: f.additions, deletions: f.deletions,
+            ...(withPatches ? { patch: truncate(f.patch ?? "", 4000) } : {}),
+          })),
         }),
       );
     },
