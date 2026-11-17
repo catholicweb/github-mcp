@@ -113,11 +113,14 @@ Afterwards, in the connector's tool permissions, set the write tools (`branch_cr
 
 ## Tools
 
-`repo_tree`, `file_get`, `grep`, `branches_list`, `branch_create`, `push_files`, `pr_create`, `prs_list`, `pr_get`.
+`repo_tree`, `file_get`, `grep`, `branches_list`, `branch_create`, `push_files`, `pr_create`, `pr_update`, `prs_list`, `pr_get`.
 
 Token-saving helpers for an AI client:
 
-- **`grep`**: regex or literal search over a branch (glob / path filters, context lines), returning `path:line:text`. It scans at most 120 text files per call (one GitHub subrequest each); binary, >200 KB and lock files are skipped, and the result says when the scan was limited.
+- **`grep`**: regex or literal search over a branch (glob / path filters, context lines), returning `path:line:text`. It scans at most 40 text files per call (one GitHub subrequest each); binary, >200 KB and lock files are skipped. When more files match the filters the result starts with `PARTIAL:` and says which files were covered; narrow with `path_prefix`/`glob` or continue with `offset`. For repo-wide questions on a big repo, a narrow `path_prefix` or a local clone is more reliable.
+- **Clone vs. grep**: use `grep` + `file_get` for small targeted changes. For broad exploration, multi-file changes or running the test suite, a client with a sandbox that can reach github.com can clone the repo (read-only is enough) and still deliver the change through `push_files`; this server never needs the sandbox to hold credentials. Send one commit per change: the PR opens with the first `push_files` call that asks for it.
+- **`pr_get` shows CI**: `checks` lists check runs and commit statuses with an overall `state` (`passing` / `failing` / `pending` / `none`). Reading them needs the token permissions *Checks: read* and *Commit statuses: read*; without them `checks` says it is unavailable and everything else still works.
+- **`pr_update`** edits the title/body of an open PR that comes from a `BRANCH_PREFIX` branch of this repo (same guard as the write tools). It cannot merge, close or retarget.
 - **`file_get` with `paths`**: read up to 20 files (optionally the same line range of each) in one call; a bad path is reported inline instead of failing the call. Files the contents API already inlines no longer cost a second blob request.
 - **Built-in validation** (`checkContent` in `src/validate.ts`) runs on every file `push_files` would write: `.json` must parse (tsconfig/jsconfig/`.vscode` JSONC files and already-broken files only warn), NUL bytes are rejected, merge-conflict markers warn. Errors abort before anything is committed; warnings are listed in the result. Add more dependency-free checks there.
 
