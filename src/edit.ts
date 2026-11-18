@@ -1,4 +1,4 @@
-import { UserError, asObject, optBool, reqString } from "./validate.ts";
+import { UserError, asObject, coerceJson, optBool, reqString } from "./validate.ts";
 
 export interface Edit {
   old_str: string;
@@ -10,6 +10,7 @@ export const MAX_EDITS = 50;
 
 /** Validate the `edits` argument of a patched file. */
 export function parseEdits(v: unknown, label: string, maxNew: number): Edit[] {
+  v = coerceJson(v);
   if (!Array.isArray(v) || v.length === 0 || v.length > MAX_EDITS) {
     throw new UserError(`${label}: edits must be an array of 1-${MAX_EDITS} {old_str, new_str} objects`);
   }

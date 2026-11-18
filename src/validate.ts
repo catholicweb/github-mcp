@@ -117,23 +117,59 @@ export function optString(v: unknown, label: string, max = 10_000): string | und
   return reqString(v, label, 0, max);
 }
 
-export function optInt(v: unknown, label: string, min: number, max: number, dflt: number): number {
-  if (v === undefined || v === null) return dflt;
-  if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) {
-    throw new UserError(`${label}: must be an integer ${min}-${max}`);
+/**
+ * Some MCP clients send objects/arrays as JSON-encoded strings (e.g. pr: "{\"title\":\"x\"}").
+ * Decode those instead of failing; anything else is returned unchanged.
+ */
+export function coerceJson(v: unknown): unknown {
+  if (typeof v !== "string") return v;
+  const t = v.trim();
+  if (!t.startsWith("{") && !t.startsWith("[")) return v;
+  try {
+    return JSON.parse(t);
+  } catch {
+    return v;
   }
-  return v;
 }
 
+/**
+ * Optional integer. Numeric strings ("3") are accepted. With clamp=true an out-of-range number is
+ * pulled into [min, max] instead of rejected (use for soft limits like context lines or result caps).
+ */
+export function optInt(v: unknown, label: string, min: number, max: number, dflt: number, clamp = false): number {
+  if (v === undefined || v === null || v === "") return dflt;
+  let n: unknown = typeof v === "string" && /^\s*-?\d+\s*$/.test(v) ? Number(v) : v;
+  if (clamp && typeof n === "number" && Number.isFinite(n)) n = Math.min(max, Math.max(min, Math.round(n)));
+  if (typeof n !== "number" || !Number.isInteger(n) || n < min || n > max) {
+    throw new UserError(`${label}: must be an integer ${min}-${max}`);
+  }
+  return n;
+}
+
+/** Optional boolean. The strings "true"/"false" are accepted. */
 export function optBool(v: unknown, label: string, dflt: boolean): boolean {
-  if (v === undefined || v === null) return dflt;
-  if (typeof v !== "boolean") throw new UserError(`${label}: must be a boolean`);
+  if (v === undefined || v === null || v === "") return dflt;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "true") return true;
+    if (s === "false") return false;
+  }
+  if (typeof v !== "boolean") throw new UserError(`${label}: must be a boolean (true or false)`);
   return v;
 }
 
 export function asObject(v: unknown, label: string): Record<string, unknown> {
-  if (typeof v !== "object" || v === null || Array.isArray(v)) throw new UserError(`${label}: must be an object`);
-  return v as Record<string, unknown>;
+  const o = coerceJson(v);
+  if (typeof o !== "object" || o === null || Array.isArray(o)) {
+    throw new UserError(`${label}: must be an object${typeof v === "string" ? " (got a plain string; pass a JSON object such as {\"title\": \"...\"})" : ""}`);
+  }
+  return o as Record<string, unknown>;
+}
+
+export function asArray(v: unknown, label: string): unknown[] {
+  const a = coerceJson(v);
+  if (!Array.isArray(a)) throw new UserError(`${label}: must be an array`);
+  return a;
 }
 
 export function truncate(text: string, max = 60_000): string {

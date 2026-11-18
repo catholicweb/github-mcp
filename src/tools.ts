@@ -3,6 +3,7 @@ import { applyEdits, countLines, parseEdits, renderFile, type Edit } from "./edi
 import { escapeRegExp, globToRegExp, grepText } from "./search.ts";
 import {
   UserError,
+  asArray,
   asObject,
   checkContent,
   optBool,
@@ -52,6 +53,11 @@ interface PrInput {
 
 function parsePr(v: unknown, label: string): PrInput | undefined {
   if (v === undefined || v === null) return undefined;
+  if (typeof v === "string") {
+    if (v.trim() === "") return undefined; // empty string = no PR
+    // A bare string that is not JSON is taken as the PR title.
+    if (!/^\s*\{/.test(v)) return { title: reqString(v.trim(), `${label}.title`, 1, 256), body: "", draft: false };
+  }
   const o = asObject(v, label);
   return {
     title: reqString(o.title, `${label}.title`, 1, 256),
@@ -189,8 +195,9 @@ export const tools: ToolDef[] = [
       if (a.path !== undefined && a.paths !== undefined) throw new UserError("use either path or paths, not both");
       let paths: string[];
       if (a.paths !== undefined) {
-        if (!Array.isArray(a.paths) || a.paths.length < 1 || a.paths.length > 20) throw new UserError("paths: must be an array of 1-20 paths");
-        paths = a.paths.map((p, i) => reqString(p, `paths[${i}]`, 1, 400));
+        const list = asArray(a.paths, "paths");
+        if (list.length < 1 || list.length > 20) throw new UserError("paths: must be an array of 1-20 paths");
+        paths = list.map((p, i) => reqString(p, `paths[${i}]`, 1, 400));
       } else {
         paths = [reqString(a.path, "path", 1, 400)];
       }
@@ -247,8 +254,8 @@ export const tools: ToolDef[] = [
         glob: { type: "string", description: 'Only search matching paths, e.g. "**/*.ts" or "*.{js,ts}" (no "/" = match file name at any depth).' },
         literal: { type: "boolean", description: "Treat pattern as plain text." },
         ignore_case: { type: "boolean" },
-        context: { type: "integer", minimum: 0, maximum: 5, description: "Lines of context around each match (default 0)." },
-        max_results: { type: "integer", minimum: 1, maximum: 200, description: "Default 50." },
+        context: { type: "integer", minimum: 0, maximum: 5, description: "Lines of context before and after each match (0-5, default 0). Values above 5 are capped at 5." },
+        max_results: { type: "integer", minimum: 1, maximum: 200, description: "Max matches to return (1-200, default 50; larger values are capped)." },
         offset: { type: "integer", minimum: 0, description: "Skip the first N candidate files (sorted by path). Use the value from a PARTIAL result to continue." },
       },
       required: ["pattern"],
@@ -273,8 +280,8 @@ export const tools: ToolDef[] = [
       } catch {
         throw new UserError("glob: invalid pattern");
       }
-      const context = optInt(a.context, "context", 0, 5, 0);
-      const max = optInt(a.max_results, "max_results", 1, 200, 50);
+      const context = optInt(a.context, "context", 0, 5, 0, true);
+      const max = optInt(a.max_results, "max_results", 1, 200, 50, true);
       const branch = validateBranchName(a.branch ?? cfg.defaultBranch);
 
       const head = await gh.branchHead(branch);
@@ -369,7 +376,8 @@ export const tools: ToolDef[] = [
       `Prefer "edits" (str_replace-style patch: old_str must match exactly once, or set replace_all) over resending a whole file; ` +
       `use "content" only for new files or full rewrites. "moves" renames without resending content. ` +
       `Set create_branch: true to create the branch from the default branch if it is missing, and pr to open (or reuse) the PR. ` +
-      `Fast-forward only; never force; CI/workflow files (.github/, CODEOWNERS, etc.) are blocked; text files only.`,
+      `Fast-forward only; never force; CI/workflow files (.github/, CODEOWNERS, etc.) are blocked; text files only. ` +
+      `Pass real JSON values, not quoted strings: pr is an object like {"title": "...", "body": "..."} (omit it to open no PR), files is an array of objects.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -417,7 +425,7 @@ export const tools: ToolDef[] = [
         deletions: { type: "array", description: "Paths to delete.", items: { type: "string" } },
         pr: {
           type: "object",
-          description: "Also open a PR into the default branch (reuses the PR if one is already open for this branch). Never merged by this server.",
+          description: `Optional. An object, e.g. {"title": "Fix X", "body": "details", "draft": false}: also opens a PR into the default branch (reuses the PR if one is already open for this branch). Omit the field to open no PR. Never merged by this server.`,
           properties: { title: { type: "string" }, body: { type: "string" }, draft: { type: "boolean" } },
           required: ["title"],
           additionalProperties: false,
@@ -433,12 +441,10 @@ export const tools: ToolDef[] = [
       const createBranch = optBool(a.create_branch, "create_branch", false);
       const pr = parsePr(a.pr, "pr");
 
-      const rawFiles = a.files === undefined ? [] : a.files;
-      const rawMoves = a.moves === undefined ? [] : a.moves;
-      const rawDeletes = a.deletions === undefined ? [] : a.deletions;
-      if (!Array.isArray(rawFiles) || !Array.isArray(rawMoves) || !Array.isArray(rawDeletes)) {
-        throw new UserError("files/moves/deletions must be arrays");
-      }
+      const arr = (v: unknown, label: string): unknown[] => (v === undefined || v === null ? [] : asArray(v, label));
+      const rawFiles = arr(a.files, "files");
+      const rawMoves = arr(a.moves, "moves");
+      const rawDeletes = arr(a.deletions, "deletions");
       const count = rawFiles.length + rawMoves.length + rawDeletes.length;
       if (count === 0) throw new UserError("nothing to commit");
       if (count > MAX_FILES) throw new UserError(`at most ${MAX_FILES} changes per commit`);

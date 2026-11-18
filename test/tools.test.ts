@@ -4,7 +4,7 @@ import { applyEdits, countLines, renderFile } from "../src/edit.ts";
 import { BranchMissing, GitHubError } from "../src/github.ts";
 import { globToRegExp } from "../src/search.ts";
 import { tools, type Config } from "../src/tools.ts";
-import { UserError } from "../src/validate.ts";
+import { UserError, asArray, asObject, optBool, optInt } from "../src/validate.ts";
 
 const cfg: Config = { repo: "me/repo", defaultBranch: "main", prefix: "claude/" };
 const b64 = (s: string) => Buffer.from(s).toString("base64");
@@ -250,4 +250,34 @@ test("push_files validation: broken JSON blocks the commit; pre-existing breakag
   assert.match(out, /tsconfig\.json: invalid JSON/);
   assert.match(out, /c\.txt: contains merge conflict markers/);
   assert.ok(gh.reqs.some((r) => r.path === "/git/trees"));
+});
+
+// --- forgiving argument parsing -------------------------------------------------
+test("argument helpers accept stringified values and clamp soft limits", () => {
+  assert.equal(optInt("3", "n", 0, 5, 0), 3);
+  assert.equal(optInt(9, "context", 0, 5, 0, true), 5);
+  assert.equal(optInt("12", "context", 0, 5, 0, true), 5);
+  assert.equal(optInt(-2, "context", 0, 5, 0, true), 0);
+  assert.throws(() => optInt(9, "n", 0, 5, 0), /integer 0-5/); // hard limits still reject
+  assert.throws(() => optInt("abc", "n", 0, 5, 0, true), /integer 0-5/);
+  assert.equal(optBool("true", "b", false), true);
+  assert.equal(optBool("False", "b", true), false);
+  assert.throws(() => optBool("yes", "b", false), /boolean/);
+  assert.deepEqual(asObject('{"title":"x"}', "pr"), { title: "x" });
+  assert.throws(() => asObject("just text", "pr"), /pr: must be an object/);
+  assert.deepEqual(asArray('["a","b"]', "deletions"), ["a", "b"]);
+  assert.throws(() => asArray("nope", "files"), /files: must be an array/);
+});
+
+test("grep caps context above 5 instead of failing", async () => {
+  const gh = fakeGh({ files: grepFiles });
+  const out = await grep(gh, { pattern: "beta", glob: "src/a.ts", context: 9 });
+  assert.match(out, /^1 match in 1 file/);
+  assert.match(await grep(gh, { pattern: "beta", glob: "src/a.ts", context: "1", max_results: "5" }), /^1 match in 1 file/);
+});
+
+test("push_files accepts JSON-string arrays and an empty pr", async () => {
+  const gh = fakeGh({ files: {}, branches: ["main", "claude/x"] });
+  const out = await push(gh, { branch: "claude/x", message: "m", files: JSON.stringify([{ path: "a.txt", content: "x" }]), pr: "" });
+  assert.match(out, /Committed/);
 });
